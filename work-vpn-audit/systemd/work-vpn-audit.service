@@ -1,0 +1,8 @@
+[Unit]
+Description=Audit external IP of work VPN connections
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/work-vpn-audit audit
+TimeoutStartSec=40

@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Small, dependency-free SSH local port forwarding manager (Linux)."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "tunnels"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "tunnels"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+
+
+def die(message):
+    raise SystemExit(f"Ошибка: {message}")
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("ожидался объект JSON")
+        return data
+    except (ValueError, OSError) as error:
+        die(f"не удалось прочитать {CONFIG_FILE}: {error}")
+
+
+def save_config(data):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = CONFIG_FILE.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    os.replace(temporary, CONFIG_FILE)
+
+
+def pid_path(name):
+    return STATE_DIR / f"{name}.pid"
+
+
+def ssh_command(item):
+    # Brackets are required for IPv6 endpoints in SSH's -L format.
+    local_host = item["bind"]
+    remote_host = item["remote_host"]
+    if ":" in local_host:
+        local_host = f"[{local_host}]"
+    if ":" in remote_host:
+        remote_host = f"[{remote_host}]"
+    forward = f'{local_host}:{item["local_port"]}:{remote_host}:{item["remote_port"]}'
+    return ["ssh", "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes", "-L", forward, item["ssh"]]
+
+
+def running_pid(name, item):
+    path = pid_path(name)
+    try:
+        pid = int(path.read_text().strip())
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        actual = [os.fsdecode(part) for part in command if part]
+        expected = ssh_command(item)
+        if actual and Path(actual[0]).name == "ssh" and actual[1:] == expected[1:]:
+            return pid
+    except (ValueError, FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+    return None
+
+
+def prompt_value(label, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value if value else (str(default) if default is not None else "")
+
+
+def valid_port(value, label):
+    try:
+        port = int(value)
+    except (ValueError, TypeError):
+        die(f"{label}: порт должен быть числом")
+    if not 1 <= port <= 65535:
+        die(f"{label}: порт должен быть от 1 до 65535")
+    return port
+
+
+def add_or_edit(args, edit=False):
+    data = load_config()
+    name = args.name or prompt_value("Имя туннеля")
+    if not NAME_PATTERN.fullmatch(name):
+        die("имя: только латинские буквы, цифры, _ и -")
+    if edit and name not in data:
+        die(f"туннель {name} не найден")
+    if not edit and name in data:
+        die(f"туннель {name} уже существует; используйте edit")
+    previous = data.get(name, {})
+    if edit and running_pid(name, previous):
+        die("сначала остановите работающий туннель")
+
+    def value(key, label, default=None):
+        current = previous.get(key, default)
+        incoming = getattr(args, key, None)
+        return incoming if incoming is not None else prompt_value(label, current)
+
+    ssh = value("ssh", "SSH-хост (алиас из ~/.ssh/config или user@server)")
+    bind = value("bind", "Локальный адрес", "127.0.0.1")
+    local_port = valid_port(value("local_port", "Локальный порт"), "локальный порт")
+    remote_host = value("remote_host", "Адрес сервиса со стороны SSH-сервера", "127.0.0.1")
+    remote_port = valid_port(value("remote_port", "Удалённый порт"), "удалённый порт")
+    if not ssh or ssh.startswith("-") or any(ch.isspace() for ch in ssh):
+        die("SSH-хост должен быть одним аргументом и не начинаться с -")
+    if not bind or not remote_host or any(ch.isspace() for ch in bind + remote_host):
+        die("некорректный адрес")
+    data[name] = dict(ssh=ssh, bind=bind, local_port=local_port,
+                      remote_host=remote_host, remote_port=remote_port)
+    save_config(data)
+    print(f"Сохранён туннель {name}")
+
+
+def start(name, data):
+    item = data[name]
+    pid = running_pid(name, item)
+    if pid:
+        print(f"{name}: уже запущен (PID {pid})")
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A separate session lets the tunnel survive closing this terminal.
+    log_path = STATE_DIR / f"{name}.log"
+    # SSH keeps this file descriptor after the manager exits. A pipe would be
+    # closed by the parent and could terminate SSH with SIGPIPE on later writes.
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen(ssh_command(item), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=log,
+                                   start_new_session=True)
+    pid_path(name).write_text(str(process.pid), encoding="ascii")
+    # Don't claim success until the forwarding port actually accepts TCP.
+    # Connection setup may take several seconds with ProxyJump or slow networks.
+    address = item["bind"]
+    if address in ("0.0.0.0", "::", "*"):
+        address = "127.0.0.1"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        code = process.poll()
+        if code is not None:
+            pid_path(name).unlink(missing_ok=True)
+            message = log_path.read_text(errors="replace").strip()
+            die(f"{name}: SSH завершился (код {code}). {message or 'Подробностей в логе нет'}")
+        try:
+            with socket.create_connection((address, item["local_port"]), timeout=0.2):
+                if process.poll() is None:
+                    print(f"{name}: запущен (PID {process.pid})")
+                    return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.2)
+    print(f"{name}: SSH ещё подключается (PID {process.pid}). Проверьте tunnels status и {log_path}")
+
+
+def stop(name, data):
+    pid = running_pid(name, data[name])
+    if not pid:
+        print(f"{name}: не запущен")
+        pid_path(name).unlink(missing_ok=True)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    pid_path(name).unlink(missing_ok=True)
+    print(f"{name}: остановлен")
+
+
+def show(data):
+    if not data:
+        print("Пока нет туннелей. Добавьте первый: tunnels add")
+        return
+    for name, item in sorted(data.items()):
+        pid = running_pid(name, item)
+        status = f"● работает (PID {pid})" if pid else "○ выключен"
+        print(f'{name:20} {status:25} {item["bind"]}:{item["local_port"]} → '
+              f'{item["remote_host"]}:{item["remote_port"]} через {item["ssh"]}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Сохранённые SSH-пробросы портов")
+    sub = parser.add_subparsers(dest="command")
+    for command in ("add", "edit"):
+        p = sub.add_parser(command, help="создать или изменить туннель")
+        p.add_argument("name", nargs="?")
+        p.add_argument("--ssh", help="SSH-алиас или user@host")
+        p.add_argument("--bind", help="локальный адрес (по умолчанию 127.0.0.1)")
+        p.add_argument("--local-port", type=int)
+        p.add_argument("--remote-host")
+        p.add_argument("--remote-port", type=int)
+    for command in ("start", "stop", "del"):
+        p = sub.add_parser(command, help=f"{command} туннель")
+        p.add_argument("name", help="имя туннеля или all для start/stop")
+    rename_parser = sub.add_parser("rename", help="переименовать туннель")
+    rename_parser.add_argument("old")
+    rename_parser.add_argument("new")
+    sub.add_parser("list", help="показать сохранённые туннели")
+    sub.add_parser("status", help="показать состояние туннелей")
+    args = parser.parse_args()
+    if args.command in ("add", "edit"):
+        add_or_edit(args, edit=args.command == "edit")
+        return
+    data = load_config()
+    if args.command in (None, "list", "status"):
+        show(data)
+        return
+    if args.command == "rename":
+        if args.old not in data:
+            die(f"туннель {args.old} не найден")
+        if not NAME_PATTERN.fullmatch(args.new):
+            die("имя: только латинские буквы, цифры, _ и -")
+        if args.new in data:
+            die(f"туннель {args.new} уже существует")
+        if running_pid(args.old, data[args.old]):
+            die("сначала остановите туннель")
+        data[args.new] = data.pop(args.old)
+        save_config(data)
+        pid_path(args.old).unlink(missing_ok=True)
+        print(f"Переименовано: {args.old} → {args.new}")
+        return
+    if args.name == "all":
+        if args.command == "del":
+            die("del all не поддерживается")
+        names = sorted(data)
+    else:
+        if args.name not in data:
+            die(f"туннель {args.name} не найден")
+        names = [args.name]
+    for name in names:
+        if args.command == "start":
+            start(name, data)
+        elif args.command == "stop":
+            stop(name, data)
+        elif args.command == "del":
+            if running_pid(name, data[name]):
+                die("сначала остановите туннель")
+            del data[name]
+            save_config(data)
+            pid_path(name).unlink(missing_ok=True)
+            print(f"{name}: удалён")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nОтменено", file=sys.stderr)
+        sys.exit(130)

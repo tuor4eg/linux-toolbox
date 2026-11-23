@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic VPN-over-proxy route check
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=15s
+AccuracySec=2s
+Unit=vpnctl.service
+[Install]
+WantedBy=timers.target

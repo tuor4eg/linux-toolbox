@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Manage explicit direct routes across known Outline/Hiddify Linux policy routing.
+
+No legacy route/rule adoption: pre-existing objects without a matching ledger entry
+are treated as foreign. State is stored outside the repository.
+"""
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+CONFIG = Path('/etc/bypass-routes.json')
+POLICY = Path('/etc/bypass-policy.json')
+STATE = Path('/var/lib/bypass/managed-routes.json')
+LOCK = Path('/run/lock/bypass.lock')
+BAD_DEV_PREFIXES = ('tun', 'tap', 'wg', 'ppp', 'outline', 'docker', 'br-', 'veth', 'tailscale', 'zt')
+
+
+def command(*args, allow_missing=False):
+    proc = subprocess.run(args, capture_output=True, text=True)
+    if proc.returncode and not allow_missing:
+        raise RuntimeError(f'{" ".join(args)}: {proc.stderr.strip()}')
+    return proc
+
+
+def atomic_json(path, value, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix='.bypass-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as out:
+            json.dump(value, out, ensure_ascii=False, indent=2, sort_keys=True)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def load_config():
+    if not CONFIG.exists():
+        return {}
+    data = json.loads(CONFIG.read_text())
+    if not isinstance(data, dict):
+        raise RuntimeError('Конфигурация исключений должна быть объектом')
+    for target, ips in data.items():
+        if not isinstance(target, str) or not isinstance(ips, list):
+            raise RuntimeError('Некорректная запись исключений')
+        for ip in ips:
+            ipaddress.IPv4Network(ip, strict=False)
+    return data
+
+
+def policy_and_gateway():
+    opts = json.loads(POLICY.read_text()) if POLICY.exists() else {}
+    if not isinstance(opts, dict):
+        raise RuntimeError('Политика должна быть объектом JSON')
+    if set(opts) - {'outline_table', 'priority', 'protected_networks', 'protected_endpoints'}:
+        raise RuntimeError('Неизвестные параметры политики')
+    networks = opts.get('protected_networks', [])
+    endpoints = opts.get('protected_endpoints', [])
+    if not isinstance(networks, list) or not isinstance(endpoints, list):
+        raise RuntimeError('Защищённые адреса должны быть списками')
+    table = int(opts.get('outline_table', 7113))
+    priority = int(opts.get('priority', 800))
+    if not 1 <= table <= 4294967295 or not 1 <= priority <= 32765:
+        raise RuntimeError('Некорректная таблица или приоритет')
+    protected = [ipaddress.IPv4Network(x, strict=False) for x in networks]
+    protected_servers = {str(ipaddress.IPv4Address(x)) for x in endpoints}
+    raw = command('ip', '-j', '-4', 'route', 'show', 'table', 'main', 'default').stdout
+    routes = [r for r in json.loads(raw or '[]') if r.get('dst') == 'default']
+    if not routes:
+        raise RuntimeError('В main нет маршрута по умолчанию')
+    metric = min(int(r.get('metric', 0)) for r in routes)
+    selected = [r for r in routes if int(r.get('metric', 0)) == metric]
+    if len(selected) != 1:
+        raise RuntimeError('Неоднозначный default-маршрут в main')
+    dev, gw = selected[0].get('dev'), selected[0].get('gateway')
+    if not isinstance(dev, str) or not isinstance(gw, str) or dev.lower().startswith(BAD_DEV_PREFIXES):
+        raise RuntimeError('Обычный физический шлюз не определён')
+    gateway = str(ipaddress.IPv4Address(gw))
+    if command('ip', 'link', 'show', 'dev', dev, allow_missing=True).returncode:
+        raise RuntimeError('Основной интерфейс недоступен')
+    return {'gateway': gateway, 'dev': dev, 'table': str(table), 'priority': str(priority),
+            'protected': protected, 'servers': protected_servers}
+
+
+def active_openvpn_endpoints():
+    found = set()
+    for path in Path('/proc').iterdir():
+        if not path.name.isdecimal():
+            continue
+        try:
+            args = (path / 'cmdline').read_bytes().decode(errors='replace').split('\0')
+        except (OSError, PermissionError):
+            continue
+        if not args or not args[0].endswith('/openvpn'):
+            continue
+        if '--remote' in args:
+            idx = args.index('--remote') + 1
+            if idx < len(args):
+                try:
+                    found.add(str(ipaddress.IPv4Address(args[idx])))
+                except ipaddress.AddressValueError:
+                    pass
+    return found
+
+
+def validate(ips, settings):
+    servers = settings['servers'] | active_openvpn_endpoints()
+    for item in ips:
+        net = ipaddress.IPv4Network(item, strict=False)
+        if any(net.overlaps(protected) for protected in settings['protected']):
+            raise RuntimeError(f'{net}: защищённая подсеть')
+        if any(ipaddress.IPv4Address(server) in net for server in servers):
+            raise RuntimeError(f'{net}: адрес VPN-сервера')
+        if net.is_loopback or net.is_multicast or net.is_unspecified:
+            raise RuntimeError(f'{net}: недопустимый адрес')
+
+
+def normalize(raw):
+    raw = raw.strip()
+    try:
+        return str(ipaddress.IPv4Network(raw, strict=False))
+    except ValueError:
+        host = urlsplit(raw if '://' in raw else 'https://' + raw).hostname
+        if not host:
+            raise ValueError('Некорректный адрес')
+        return host.lower().rstrip('.')
+
+
+def resolve(name):
+    try:
+        return [str(ipaddress.IPv4Network(name, strict=False))]
+    except ValueError:
+        pass
+    return sorted({item[4][0] + '/32' for item in socket.getaddrinfo(name, None, socket.AF_INET)})
+
+
+def all_ips(data):
+    return {str(ipaddress.IPv4Network(ip, strict=False)) for values in data.values() for ip in values}
+
+
+def load_state():
+    if not STATE.exists():
+        return {'version': 1, 'routes': {}, 'rules': {}}
+    value = json.loads(STATE.read_text())
+    if not isinstance(value, dict) or value.get('version') != 1 or not isinstance(value.get('routes'), dict) or not isinstance(value.get('rules'), dict):
+        raise RuntimeError('Некорректный реестр собственных маршрутов')
+    return value
+
+
+def route_key(table, dest):
+    return table + '|' + dest
+
+
+def exact_routes(table, dest):
+    result = command('ip', '-j', '-4', 'route', 'show', 'table', table, 'to', dest)
+    return [r for r in json.loads(result.stdout or '[]')
+            if r.get('dst', 'default') != 'default'
+            and ipaddress.IPv4Network(r['dst'], strict=False) == ipaddress.IPv4Network(dest, strict=False)]
+
+
+def exact_rules(dest, priority):
+    # Parse narrowly: don't claim marked, source-scoped or otherwise qualified rules.
+    result = command('ip', '-4', 'rule', 'show').stdout
+    canonical = str(ipaddress.IPv4Network(dest, strict=False))
+    matches = []
+    for line in result.splitlines():
+        m = re.match(r'^\s*(\d+):\s+from all to (\S+) lookup main\s*$', line)
+        if m and int(m.group(1)) == int(priority):
+            try:
+                if str(ipaddress.IPv4Network(m.group(2), strict=False)) == canonical:
+                    matches.append(line)
+            except ValueError:
+                pass
+    return matches
+
+
+def save_state(state):
+    atomic_json(STATE, state)
+
+
+def plan_route(state, table, dest, settings):
+    key = route_key(table, dest)
+    owned = state['routes'].get(key)
+    existing = exact_routes(table, dest)
+    if len(existing) > 1:
+        raise RuntimeError(f'{dest} table={table}: несколько маршрутов')
+    if existing:
+        route = existing[0]
+        if not owned or route.get('gateway') != owned.get('gateway') or route.get('dev') != owned.get('dev'):
+            raise RuntimeError(f'{dest} table={table}: чужой/унаследованный маршрут; автоматический захват запрещён')
+    return owned, existing
+
+
+def ensure_route(state, table, dest, settings):
+    owned, existing = plan_route(state, table, dest, settings)
+    if existing and owned['gateway'] == settings['gateway'] and owned['dev'] == settings['dev']:
+        return
+    command('ip', '-4', 'route', 'replace', dest, 'via', settings['gateway'], 'dev', settings['dev'], 'table', table)
+    state['routes'][route_key(table, dest)] = {'gateway': settings['gateway'], 'dev': settings['dev']}
+    save_state(state)
+
+
+def ensure_rule(state, dest, priority):
+    # Rules with other selectors / priorities are not ours; do not delete them.
+    matches = exact_rules(dest, priority)
+    owned = state['rules'].get(dest)
+    if len(matches) > 1 or (matches and owned != priority):
+        raise RuntimeError(f'{dest}: чужое/унаследованное правило priority={priority}')
+    if owned and owned != priority:
+        raise RuntimeError(f'{dest}: изменился приоритет; требуется ручная миграция')
+    if not matches:
+        command('ip', '-4', 'rule', 'add', 'priority', priority, 'to', dest, 'lookup', 'main')
+        state['rules'][dest] = priority
+        save_state(state)
+
+
+def delete_owned_route(state, table, dest):
+    key = route_key(table, dest)
+    owned = state['routes'].get(key)
+    if not owned:
+        return
+    existing = exact_routes(table, dest)
+    if existing:
+        if len(existing) != 1 or existing[0].get('gateway') != owned['gateway'] or existing[0].get('dev') != owned['dev']:
+            raise RuntimeError(f'{dest} table={table}: маршрут изменён извне; удалять нельзя')
+        command('ip', '-4', 'route', 'del', dest, 'via', owned['gateway'], 'dev', owned['dev'], 'table', table)
+    del state['routes'][key]
+    save_state(state)
+
+
+def delete_owned_rule(state, dest):
+    priority = state['rules'].get(dest)
+    if priority is None:
+        return
+    matches = exact_rules(dest, priority)
+    if len(matches) > 1:
+        raise RuntimeError(f'{dest}: неоднозначное правило, удаление запрещено')
+    if matches:
+        command('ip', '-4', 'rule', 'del', 'priority', priority, 'to', dest, 'lookup', 'main')
+    del state['rules'][dest]
+    save_state(state)
+
+
+def direct_docker(dest):
+    for r in exact_routes('main', dest):
+        dev = r.get('dev', '')
+        if not r.get('gateway') and (dev == 'docker0' or dev.startswith('br-')):
+            return True
+    return False
+
+
+def apply(data, previous, settings, state):
+    desired = all_ips(data)
+    validate(desired, settings)
+    # Preflight all desired objects so legacy route conflicts fail before changes.
+    for dest in sorted(desired):
+        if not direct_docker(dest):
+            for table in (settings['table'], 'main'):
+                plan_route(state, table, dest, settings)
+        matches = exact_rules(dest, settings['priority'])
+        own = state['rules'].get(dest)
+        if len(matches) > 1 or (matches and own != settings['priority']):
+            raise RuntimeError(f'{dest}: существующее неучтённое правило; миграция вручную')
+        if own and own != settings['priority']:
+            raise RuntimeError(f'{dest}: приоритет правила изменился; миграция вручную')
+    for dest in sorted(desired):
+        if not direct_docker(dest):
+            ensure_route(state, settings['table'], dest, settings)
+            ensure_route(state, 'main', dest, settings)
+        ensure_rule(state, dest, settings['priority'])
+    # Remove only ledger-owned objects for addresses no longer required.
+    stale = (set(state['rules']) | {k.split('|', 1)[1] for k in state['routes']}) - desired
+    for dest in sorted(stale):
+        delete_owned_rule(state, dest)
+        for key in list(state['routes']):
+            table, item = key.split('|', 1)
+            if item == dest:
+                delete_owned_route(state, table, dest)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Прямые IP-маршруты мимо известных VPN-туннелей')
+    sub = parser.add_subparsers(dest='action', required=True)
+    sub.add_parser('list')
+    for name in ('add', 'del'):
+        p = sub.add_parser(name)
+        p.add_argument('targets', nargs='+')
+    sub.add_parser('restore')
+    args = parser.parse_args(argv)
+    if args.action == 'list':
+        for target, ips in sorted(load_config().items()):
+            print(target)
+            for ip in ips:
+                print('  →', ip)
+        return 0
+    if os.geteuid() != 0:
+        raise RuntimeError('Для изменений требуется sudo')
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open('a+') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        data = load_config()
+        previous = all_ips(data)
+        state = load_state()
+        settings = policy_and_gateway()
+        if args.action == 'add':
+            for target in args.targets:
+                key = normalize(target)
+                ips = resolve(key)
+                validate(ips, settings)
+                data[key] = ips
+        elif args.action == 'del':
+            for target in args.targets:
+                data.pop(normalize(target), None)
+        else:
+            for key in data:
+                try:
+                    result = resolve(key)
+                    validate(result, settings)
+                    data[key] = result
+                except socket.gaierror:
+                    print(f'DNS недоступен: {key}, старые адреса сохранены', file=sys.stderr)
+        apply(data, previous, settings, state)
+        atomic_json(CONFIG, data)
+    print('OK:', args.action)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as exc:
+        print('Ошибка:', exc, file=sys.stderr)
+        sys.exit(1)

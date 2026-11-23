@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic work VPN IP audit
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=work-vpn-audit.service
+
+[Install]
+WantedBy=timers.target

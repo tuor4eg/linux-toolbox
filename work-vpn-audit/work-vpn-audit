@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Local, read-only VPN-over-proxy audit for NetworkManager OpenVPN profiles.
+
+Only changes its own SQLite database. Does not alter VPN routes or vpnctl.
+The reported public IP belongs to a probe bound to the selected interface;
+it is NOT a server-confirmed OpenVPN client address.
+"""
+import argparse
+import datetime as dt
+import ipaddress
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG = Path('/etc/vpnctl.json')
+DB = Path('/var/lib/work-vpn-audit/history.sqlite3')
+PROBE_URL = 'https://api.ipify.org'
+
+
+def command(*argv, timeout=8):
+    try:
+        p = subprocess.run(argv, text=True, capture_output=True, timeout=timeout,
+                           check=False, env={**os.environ, 'LC_ALL': 'C',
+                                             'http_proxy': '', 'https_proxy': '',
+                                             'HTTP_PROXY': '', 'HTTPS_PROXY': '',
+                                             'ALL_PROXY': '', 'all_proxy': ''})
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, '', str(exc)
+
+
+def active_vpn_uuids():
+    rc, out, err = command('nmcli', '-t', '-f', 'UUID,TYPE', 'connection', 'show', '--active')
+    if rc:
+        raise RuntimeError('nmcli: ' + (err or 'ошибка'))
+    return {line.rsplit(':', 1)[0] for line in out.splitlines() if line.endswith(':vpn')}
+
+
+def endpoint_from_process(uuid):
+    # Mirrors vpnctl's credential-safe discovery; never reads OpenVPN config files.
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            parts = (proc / 'cmdline').read_bytes().decode('utf-8', 'replace').split('\0')
+        except (OSError, PermissionError):
+            continue
+        if not parts or not parts[0].endswith('/openvpn') or not any(uuid in x for x in parts):
+            continue
+        if '--remote' in parts:
+            idx = parts.index('--remote') + 1
+            if idx < len(parts):
+                try:
+                    return str(ipaddress.IPv4Address(parts[idx]))
+                except ipaddress.AddressValueError:
+                    return None
+    return None
+
+
+def route_to(ip):
+    rc, out, err = command('ip', '-4', 'route', 'get', ip)
+    if rc:
+        return None, err or 'ip route get failed'
+    m = re.search(r'\bdev\s+(\S+)', out)
+    return (m.group(1) if m else None), ('' if m else 'route has no interface')
+
+
+def classify(dev):
+    if not dev:
+        return 'unknown'
+    if dev.startswith('outline-tun'):
+        return 'outline'
+    if dev.startswith('tun') or dev.startswith('hiddify'):
+        return 'hiddify-or-other-tun'
+    return 'direct-or-other'
+
+
+def public_ip_for(dev):
+    if not dev:
+        return None, 'no route interface'
+    # Bind to the selected interface, not just the system's current default route.
+    rc, out, err = command('curl', '-4', '--silent', '--show-error', '--fail',
+                           '--noproxy', '*', '--interface', 'if!' + dev,
+                           '--connect-timeout', '5', '--max-time', '12', PROBE_URL, timeout=15)
+    if rc:
+        return None, (err or ('curl exit ' + str(rc)))[:300]
+    try:
+        return str(ipaddress.IPv4Address(out)), ''
+    except ipaddress.AddressValueError:
+        return None, 'invalid response from IP probe'
+
+
+def connect():
+    DB.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(DB.parent, 0o700)
+    db = sqlite3.connect(DB, timeout=10)
+    db.execute('PRAGMA busy_timeout=10000')
+    db.execute('''CREATE TABLE IF NOT EXISTS observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observed_at TEXT NOT NULL,
+        profile TEXT NOT NULL,
+        uuid TEXT NOT NULL,
+        connected INTEGER NOT NULL,
+        endpoint TEXT,
+        interface TEXT,
+        channel TEXT NOT NULL,
+        public_ip TEXT,
+        probe_status TEXT NOT NULL,
+        detail TEXT
+    )''')
+    db.execute('CREATE INDEX IF NOT EXISTS observations_lookup ON observations(observed_at, profile)')
+    db.execute('CREATE INDEX IF NOT EXISTS observations_ip ON observations(public_ip, observed_at)')
+    os.chmod(DB, 0o600)
+    return db
+
+
+def collect():
+    with CONFIG.open() as f:
+        config = json.load(f)
+    profiles = config.get('profiles', {})
+    if not isinstance(profiles, dict) or not profiles:
+        raise RuntimeError('в /etc/vpnctl.json нет profiles')
+    active = active_vpn_uuids()
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+    rows = []
+    cache = {}
+    for name, profile in profiles.items():
+        uuid = profile.get('uuid', '')
+        if not uuid:
+            continue
+        if uuid not in active:
+            rows.append((now, name, uuid, 0, None, None, 'none', None, 'disconnected', ''))
+            continue
+        value = profile.get('endpoint', 'auto')
+        if value == 'auto':
+            ep = endpoint_from_process(uuid)
+        else:
+            try:
+                ep = str(ipaddress.IPv4Address(value))
+            except (ValueError, ipaddress.AddressValueError):
+                ep = None
+        if not ep:
+            rows.append((now, name, uuid, 1, None, None, 'unknown', None,
+                         'unverified', 'cannot determine OpenVPN endpoint'))
+            continue
+        dev, route_err = route_to(ep)
+        channel = classify(dev)
+        if dev not in cache:
+            cache[dev] = public_ip_for(dev) if dev else (None, route_err)
+        ip, probe_err = cache[dev]
+        rows.append((now, name, uuid, 1, ep, dev, channel, ip,
+                     'probe_ok' if ip else 'probe_failed', probe_err or route_err))
+    if not rows:
+        raise RuntimeError('ни одного VPN-профиля в конфигурации')
+    return rows
+
+
+def audit():
+    # Do not write misleading "disconnected" samples if nmcli/config retrieval fails.
+    rows = collect()
+    with connect() as db:
+        db.executemany('''INSERT INTO observations
+            (observed_at,profile,uuid,connected,endpoint,interface,channel,public_ip,probe_status,detail)
+            VALUES (?,?,?,?,?,?,?,?,?,?)''', rows)
+        db.commit()
+    for r in rows:
+        print(f'{r[1]}: {r[8]}; server={r[4] or "—"}; '
+              f'via={r[6]} ({r[5] or "—"}); probe_ip={r[7] or "—"}'
+              + (f'; {r[9]}' if r[9] else ''))
+
+
+def history(days, ip, changes, limit):
+    if days <= 0 or limit <= 0:
+        raise RuntimeError('days и limit должны быть положительными')
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(timespec='seconds')
+    if not DB.exists():
+        print('Истории пока нет. Сначала запустите sudo work-vpn-audit audit')
+        return
+    q = '''SELECT observed_at,profile,connected,endpoint,interface,channel,public_ip,probe_status
+           FROM observations WHERE observed_at >= ?'''
+    args = [since]
+    if ip:
+        ip = str(ipaddress.IPv4Address(ip))
+        q += ' AND public_ip = ?'
+        args.append(ip)
+    q += ' ORDER BY observed_at ASC, id ASC'
+    with sqlite3.connect(f'file:{DB}?mode=ro', uri=True) as db:
+        rows = db.execute(q, args).fetchall()
+    if changes:
+        last = {}
+        selected = []
+        for r in rows:
+            fingerprint = r[2:]
+            if last.get(r[1]) != fingerprint:
+                selected.append(r)
+                last[r[1]] = fingerprint
+        rows = selected
+    rows = rows[-limit:]
+    if not rows:
+        print('Записей нет')
+        return
+    for t, name, connected, server, dev, channel, public_ip, state in rows:
+        local = dt.datetime.fromisoformat(t).astimezone().strftime('%Y-%m-%d %H:%M:%S %z')
+        print(f'{local} | {name:10} | {"UP" if connected else "DOWN":4} | '
+              f'server={server or "—"} | {channel}/{dev or "—"} | '
+              f'IP={public_ip or "—"} | {state}')
+    print(f'Показано {len(rows)} записей; IP — результат локального пробного запроса, не лог рабочего сервера.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Локальный журнал рабочих VPN (не меняет маршруты)')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('audit', help='Сделать и записать проверку')
+    h = sub.add_parser('history', help='Посмотреть сохранённую историю')
+    h.add_argument('--days', type=int, default=7)
+    h.add_argument('--ip', help='Фильтр по измеренному выходному IP')
+    h.add_argument('--changes', action='store_true', help='Только изменения по сравнению с предыдущей записью в окне')
+    h.add_argument('--limit', type=int, default=200)
+    args = parser.parse_args()
+    try:
+        if args.command == 'audit':
+            if os.geteuid() != 0:
+                raise RuntimeError('audit требует sudo (конфигурация vpnctl доступна root)')
+            audit()
+        else:
+            history(args.days, args.ip, args.changes, args.limit)
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+        print('Ошибка:', exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Conservative Linux/OpenVPN-over-proxy route manager (Python 3.10+)."""
+import argparse
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+CONFIG = Path('/etc/vpnctl.json')
+RULE_STATE = Path('/run/vpnctl-managed-rules.json')
+RULE_PRIORITY = 810  # Above Hiddify/Outline; below existing user rules (e.g. 800).
+DEFAULT = {'profiles': {}}
+
+
+def run(*args, check=False):
+    p = subprocess.run(args, text=True, capture_output=True)
+    if check and p.returncode:
+        raise RuntimeError(f"{' '.join(args)}: {p.stderr.strip()}")
+    return p
+
+
+def load():
+    if not CONFIG.exists():
+        raise RuntimeError(
+            'Отсутствует /etc/vpnctl.json. '
+            'Настройте рабочие VPN перед использованием.'
+        )
+    custom = json.loads(CONFIG.read_text())
+    # Upgrade an existing GG-only configuration without overwriting custom IPs.
+    merged = {'profiles': {name: dict(value) for name, value in DEFAULT['profiles'].items()}}
+    merged['profiles'].update(custom.get('profiles', {}))
+    return merged
+
+
+def save(cfg):
+    if os.geteuid() != 0:
+        raise RuntimeError('Для сохранения настроек требуется sudo')
+    tmp = CONFIG.with_suffix('.tmp')
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG)
+
+
+def active_uuids():
+    p = run('nmcli', '-t', '-f', 'UUID,TYPE', 'connection', 'show', '--active')
+    return {line.split(':')[0] for line in p.stdout.splitlines() if line.endswith(':vpn')}
+
+
+def openvpn_endpoint(uuid):
+    """Only inspect process arguments: never read VPN credentials/configuration secrets."""
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdecimal():
+            continue
+        try:
+            args = (proc / 'cmdline').read_bytes().decode(errors='replace').split('\0')
+        except (OSError, PermissionError):
+            continue
+        if not args or not args[0].endswith('/openvpn'):
+            continue
+        if not any(uuid in a for a in args):
+            continue
+        if '--remote' in args:
+            i = args.index('--remote')
+            if i + 1 < len(args):
+                try:
+                    return str(ipaddress.IPv4Address(args[i + 1]))
+                except ipaddress.AddressValueError:
+                    raise RuntimeError('OpenVPN использует DNS-имя сервера; задайте IPv4 вручную через endpoint')
+    return None
+
+
+def endpoint(profile):
+    value = profile.get('endpoint', 'auto')
+    if value == 'auto':
+        return openvpn_endpoint(profile['uuid'])
+    return str(ipaddress.IPv4Address(value))
+
+
+def route_get(address):
+    p = run('ip', '-4', 'route', 'get', address)
+    return p.stdout.strip() if p.returncode == 0 else ''
+
+
+def dev_from_route(s):
+    m = re.search(r'\bdev\s+(\S+)', s)
+    return m.group(1) if m else None
+
+
+def active_proxy():
+    """Recognize live Hiddify and older Outline policy-routing tables."""
+    for label, table in [('hiddify', '2022'), ('outline', '7113')]:
+        p = run('ip', '-4', 'route', 'show', 'table', table)
+        if p.returncode:
+            continue
+        for line in p.stdout.splitlines():
+            if not line.startswith('default '):
+                continue
+            dev = dev_from_route(line)
+            if not dev or run('ip', 'link', 'show', 'dev', dev).returncode:
+                continue
+            if label == 'hiddify' and not dev.startswith('tun'):
+                continue
+            if label == 'outline' and 'outline' not in dev:
+                continue
+            if dev_from_route(route_get('1.1.1.1')) != dev:
+                continue
+            return label, dev
+    return None, None
+
+
+def exact_host_route(address):
+    p = run('ip', '-j', '-4', 'route', 'show', 'table', 'main', 'to', address + '/32')
+    if p.returncode:
+        return None
+    routes = json.loads(p.stdout or '[]')
+    for route in routes:
+        if route.get('dst') in (address, address + '/32') and route.get('gateway') and route.get('dev'):
+            return route
+    return None
+
+
+def through_proxy(address, proxydev):
+    return dev_from_route(route_get(address)) == proxydev
+
+
+def vpn_routes(cfg, active):
+    """Only bypass the proxy for exact routes currently installed by an active VPN.
+
+    In overlapping networks (e.g. 192.168.125.0/24), main's actual
+    interface wins, rather than the order of profiles in the configuration.
+    """
+    active_networks = set()
+    for profile in cfg['profiles'].values():
+        if profile['uuid'] in active:
+            active_networks.update(str(ipaddress.ip_network(net, strict=False))
+                                   for net in profile.get('expected_networks', []))
+
+    result = set()
+    for net in active_networks:
+        p = run('ip', '-j', '-4', 'route', 'show', 'table', 'main', 'to', net)
+        if p.returncode:
+            continue
+        for route in json.loads(p.stdout or '[]'):
+            if route.get('dst') != net:
+                continue
+            dev = route.get('dev', '')
+            if not re.fullmatch(r'tun\d+', dev):
+                continue
+            if run('ip', 'link', 'show', 'dev', dev).returncode == 0:
+                result.add(net)
+    return result
+
+
+def rule_present(net):
+    p = run('ip', '-4', 'rule', 'show')
+    return any(re.search(r'^\s*' + str(RULE_PRIORITY) +
+                         r':\s+from all to ' + re.escape(net) +
+                         r' lookup main(?:\s|$)', line)
+               for line in p.stdout.splitlines())
+
+
+def sync_network_rules(cfg, active, proxy, dry_run=False):
+    """Track only our own rules, never remove administrator-created rules."""
+    if RULE_STATE.exists():
+        previous = set(json.loads(RULE_STATE.read_text()))
+    else:
+        previous = set()
+    desired = vpn_routes(cfg, active) if proxy else set()
+    # Do not take ownership of an existing rule we did not create.
+    additions = {net for net in desired - previous if not rule_present(net)}
+    removals = previous - desired
+    missing = {net for net in desired & previous if not rule_present(net)}
+    commands = ([['ip', '-4', 'rule', 'del', 'priority', str(RULE_PRIORITY),
+                  'to', net, 'lookup', 'main'] for net in sorted(removals)] +
+                [['ip', '-4', 'rule', 'add', 'priority', str(RULE_PRIORITY),
+                  'to', net, 'lookup', 'main'] for net in sorted(additions | missing)])
+    if dry_run:
+        return ['Сети: ' + ('; '.join(shlex.join(c) for c in commands) or 'без изменений')]
+    if commands and os.geteuid() != 0:
+        raise RuntimeError('Для изменения сетевых правил требуется sudo')
+    for cmd in commands:
+        run(*cmd, check=True)
+    owned = (previous - removals) | additions
+    if commands or (previous != owned):
+        if os.geteuid() != 0:
+            raise RuntimeError('Для сохранения состояния требуется sudo')
+        tmp = RULE_STATE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(sorted(owned)) + '\n')
+        tmp.replace(RULE_STATE)
+    return [f'Сети: {len(desired)} через рабочий VPN, правил под управлением vpnctl: {len(owned)}']
+
+
+def apply_one(name, profile, active, proxy, proxydev, dry_run=False):
+    if profile['uuid'] not in active:
+        return f'{name}: OpenVPN отключён — пропуск'
+    address = endpoint(profile)
+    if not address:
+        return f'{name}: не удалось определить IP OpenVPN-сервера'
+    if not proxy:
+        return f'{name}: Hiddify/Outline не обнаружен — маршруты не трогаем'
+    if through_proxy(address, proxydev):
+        return f'{name}: OK, {address} уже идёт через {proxy} ({proxydev})'
+    route = exact_host_route(address)
+    if not route:
+        return f'{name}: {address} не идёт через прокси; отдельного /32 маршрута нет — без изменений'
+    if route['dev'] == proxydev or route['dev'].startswith('tun'):
+        return f'{name}: маршрут /32 через VPN — автоматическое удаление запрещено'
+    cmd = ['ip', '-4', 'route', 'del', address + '/32', 'via', route['gateway'], 'dev', route['dev']]
+    if dry_run:
+        return f'{name}: удалили бы {shlex.join(cmd)}; затем проверили бы маршрут через {proxydev}'
+    if os.geteuid() != 0:
+        raise RuntimeError('Для изменения маршрута требуется sudo')
+    run(*cmd, check=True)
+    if through_proxy(address, proxydev):
+        return f'{name}: исправлено — {address} теперь через {proxy} ({proxydev})'
+    # Transactional rollback if the desired proxy route did not appear.
+    restore = ['ip', '-4', 'route', 'replace', address + '/32', 'via', route['gateway'], 'dev', route['dev']]
+    if route.get('metric') is not None:
+        restore += ['metric', str(route['metric'])]
+    r = run(*restore)
+    if r.returncode:
+        raise RuntimeError(f'{name}: маршрут НЕ восстановлен: {r.stderr.strip()}')
+    return f'{name}: прокси-маршрут не появился — прямой маршрут восстановлен'
+
+
+def status(cfg):
+    active = active_uuids()
+    proxy, dev = active_proxy()
+    print(f'Прокси: {proxy or "не обнаружен"}' + (f' ({dev})' if dev else ''))
+    for name, prof in cfg['profiles'].items():
+        up = prof['uuid'] in active
+        ip = endpoint(prof) if up else None
+        print(f'{name}: {"подключён" if up else "отключён"}; endpoint: {ip or "—"}')
+        if ip:
+            print('  ' + (route_get(ip) or 'маршрут отсутствует'))
+        for net in prof.get('expected_networks', []):
+            dest = str(ipaddress.ip_network(net, strict=False).network_address)
+            print(f'  {net}: {route_get(dest) or "нет маршрута"}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Управление OpenVPN через Hiddify/Outline')
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('status', help='Показать обнаруженные подключения и маршруты')
+    ck = sub.add_parser('check', help='Проверить доступность заданного IP через ICMP')
+    ck.add_argument('address', help='IP для проверки ICMP')
+    ap = sub.add_parser('apply', help='Безопасно исправить маршрут к серверу OpenVPN')
+    ap.add_argument('--dry-run', action='store_true')
+    ep = sub.add_parser('endpoint', help='Указать IP сервера или auto для определения из процесса')
+    ep.add_argument('profile')
+    ep.add_argument('address')
+    sub.add_parser('install-timer', help='Установить systemd timer с проверкой каждые 15 секунд')
+    args = parser.parse_args()
+    cfg = load()
+    try:
+        if args.command == 'status':
+            status(cfg)
+        elif args.command == 'check':
+            if not args.address:
+                raise RuntimeError('Укажите IP для проверки: vpnctl check <IP>')
+            ip = str(ipaddress.IPv4Address(args.address))
+            print('Маршрут:', route_get(ip) or 'отсутствует')
+            p = run('ping', '-n', '-c', '3', '-W', '2', ip)
+            print(p.stdout or p.stderr)
+            if p.returncode:
+                return p.returncode
+        elif args.command == 'apply':
+            active = active_uuids()
+            proxy, dev = active_proxy()
+            for name, prof in cfg['profiles'].items():
+                print(apply_one(name, prof, active, proxy, dev, args.dry_run))
+            for line in sync_network_rules(cfg, active, proxy, args.dry_run):
+                print(line)
+        elif args.command == 'endpoint':
+            if args.profile not in cfg['profiles']:
+                raise RuntimeError('Неизвестный профиль: ' + args.profile)
+            value = args.address if args.address == 'auto' else str(ipaddress.IPv4Address(args.address))
+            cfg['profiles'][args.profile]['endpoint'] = value
+            save(cfg)
+            print(f'{args.profile}: endpoint = {value}')
+        elif args.command == 'install-timer':
+            if os.geteuid():
+                raise RuntimeError('Требуется sudo')
+            executable = '/usr/local/bin/vpnctl'
+            if not Path(executable).exists():
+                raise RuntimeError('Сначала установите скрипт в /usr/local/bin/vpnctl')
+            Path('/etc/systemd/system/vpnctl.service').write_text(
+                '[Unit]\nDescription=Check VPN-over-proxy routes\n'
+                '[Service]\nType=oneshot\nExecStart=' + executable + ' apply\n')
+            Path('/etc/systemd/system/vpnctl.timer').write_text(
+                '[Unit]\nDescription=Periodic VPN-over-proxy route check\n'
+                '[Timer]\nOnBootSec=15s\nOnUnitActiveSec=15s\nAccuracySec=2s\nUnit=vpnctl.service\n'
+                '[Install]\nWantedBy=timers.target\n')
+            run('systemctl', 'daemon-reload', check=True)
+            run('systemctl', 'enable', '--now', 'vpnctl.timer', check=True)
+            print('Таймер установлен. Проверка: systemctl list-timers vpnctl.timer')
+    except (RuntimeError, ValueError, OSError) as exc:
+        print('Ошибка:', exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

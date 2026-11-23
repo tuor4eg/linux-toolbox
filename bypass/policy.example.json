@@ -1,0 +1,6 @@
+{
+  "outline_table": 7113,
+  "priority": 800,
+  "protected_networks": ["10.20.0.0/16"],
+  "protected_endpoints": ["198.51.100.10"]
+}
