@@ -46,7 +46,13 @@ def save(cfg):
 
 
 def active_uuids():
-    p = run('nmcli', '-t', '-f', 'UUID,TYPE', 'connection', 'show', '--active')
+    try:
+        p = run('nmcli', '-t', '-f', 'UUID,TYPE', 'connection', 'show', '--active')
+    except FileNotFoundError:
+        raise RuntimeError('nmcli не найден') from None
+    if p.returncode:
+        detail = p.stderr.strip() or 'не удалось получить список подключений'
+        raise RuntimeError('nmcli: ' + detail)
     return {line.split(':')[0] for line in p.stdout.splitlines() if line.endswith(':vpn')}
 
 

@@ -8,7 +8,8 @@ usage() {
   ./install.sh check [all|bypass|tunnels|vpnctl|work-vpn-audit]
   ./install.sh install <tool> [--replace] [--enable-timer]
 По умолчанию только проверка; установка выполняется явно.
-Для bypass --replace запрещён при наличии установленной версии.
+Для bypass --replace обновляет только v2 (в файле есть managed-routes.json).
+Старую версию без реестра установщик не заменяет и маршруты не меняет.
 HELP
 }
 cmd="${1:-}"; shift || true
